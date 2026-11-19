@@ -1,103 +1,103 @@
-#include <errno.h>
-#include <stdio.h>
 #include <stdbool.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <sys/mman.h>
+#include <stdio.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
+#include <semaphore.h>
 
+#define BUF_SZ 1024
 #define READ_EOF 0
-#define STDIN_FD  0
-#define STDOUT_FD 1
 #define stringify(a) stringify_(a)
 #define stringify_(a) #a
 #define printErr(str) perror(__FILE__ ":" stringify(__LINE__) "[ERROR]:" str)
 
-typedef unsigned int uint;
-typedef int FD;
-
-bool echoFile(FD from, FD to);
-
-#define N_BLOCKS 40
-#define BLOCK_SZ 1024
-
 typedef struct {
-    size_t read_index; __attribute__((aligned(64)))
-    size_t write_index; 
-    char buf[BLOCK_SZ][N_BLOCKS];
-} SharedBuf;
+	char data[BUF_SZ];
+	size_t count;
+} Chunk;
 
-int main(int argc, char* argv[]) {
-  if (argc < 1)
-    return 0;
 
-  int buf_fd = shm_open("/shbuf", O_RDWR | O_CREAT | O_EXCL, 0666);
-  ftruncate(buf_fd, sizeof(SharedBuf));
+void produser(int fd, Chunk* buf, sem_t *full, sem_t *empty);
+void consumer(Chunk* buf, sem_t *full, sem_t *empty);
 
-  pid_t forkPid = fork();
-  if (forkPid == 0) {
-    // child 
-    if (argc == 1) {
-      if (!echoFile(STDIN_FD, fromChild.sink))
-        return errno;
 
-      return 0;
-    }
+int main(int argc, char* argv[]){
+	Chunk* buf = mmap(NULL, 
+                      sizeof(Chunk), 
+                      PROT_READ | PROT_WRITE, 
+                      MAP_SHARED | MAP_ANON, -1, 0);
+	
+	sem_t* full = sem_open("/full", O_CREAT, 0666, 1);
+	sem_t* empty = sem_open("/empty", O_CREAT, 0666, 0);
 
-    for (uint i = 1; i < (uint)argc; i++) {
-      FD fd = open(argv[i], O_RDONLY);
-      if (fd < 0) {
-        printErr("open failed");
-        continue;
-      }
+	int fd = 0;
+	if (argc > 1){
+		fd = open(argv[1], O_RDONLY);
+	}
+	if (fd < 0){
+		printErr("open failed");
+		exit(1);
+	}
 
-      echoFile(fd, fromChild.sink);
-      close(fd);
-    }
-    close(fromChild.sink);
+	pid_t p = fork();
+	if (p < 0) {
+		perror("fork failed");
+		exit(1);
+	}
 
-    exit(0);
-  }
+	if (p == 0){
+		produser(fd, buf, full, empty);
+		if (fd != 0) 
+            close(fd);
+		return 0;
+	}
 
-  // parent
-  
-  close(fromChild.sink);
-  echoFile(fromChild.source, STDOUT_FD);
-  close(fromChild.source);
+	consumer(buf, full, empty);
 
-  wait(NULL);
-  close(buf_fd);
+	wait(NULL);
 
-  return 0;
+	sem_close(full);
+	sem_close(empty);
+	sem_unlink("/full");
+	sem_unlink("/empty");
+	munmap(buf, sizeof(Chunk));
+
+	return 0;		
 }
 
-bool echoFile(FD from, FD to) {
-  if (from < 0 || to < 0)
-    return false;
+void produser(int fd, Chunk* buf, sem_t *full, sem_t *empty){
+	while (true) {
+		sem_wait(full);
+	
+		ssize_t readCount = read(fd, buf->data, 1024);
+		if (readCount < 0) {
+            printErr("read failed");
+			exit(1);
+		}
+        buf->count = readCount;
 
-  char buf[BUF_SZ] = {0};
-  bool failed = false;
-  while (true) {
-    ssize_t readCount = read(from, &buf, BUF_SZ);
-    if (readCount == READ_EOF)
-      break;
-    else if (readCount < 0) {  
-      printErr("read failed");
-      failed = true;
-      break;
-    }
+		sem_post(empty);
+		
+		if (buf->count == READ_EOF)
+            break;	
+	}
+}
 
-    for (ssize_t remainingCount = readCount; remainingCount > 0; ) {
-      ssize_t writtenCount = write(to, buf, remainingCount);
-      if (writtenCount < 0) {  
-        printErr("write failed");
-        failed = true;
-        break;
-      }
-      remainingCount -= writtenCount;
-    }
-  }
 
-  return !failed;
+void consumer(Chunk* buf, sem_t *full, sem_t *empty){
+	while (true) {
+		sem_wait(empty);
+		
+		if (buf->count == 0) break;
+
+		ssize_t w = write(1, buf->data, buf->count);
+		if (w < 0){
+			printErr("write failed");
+			exit(1);
+		}
+	
+		sem_post(full);
+	}
 }
